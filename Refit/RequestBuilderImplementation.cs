@@ -14,7 +14,8 @@ namespace Refit
 
     partial class RequestBuilderImplementation : IRequestBuilder
     {
-        static readonly HashSet<HttpMethod> BodylessMethods = [HttpMethod.Get, HttpMethod.Head];
+        static readonly QueryAttribute DefaultQueryAttribute = new ();
+        static readonly Uri BaseUri = new ("http://api");
         readonly Dictionary<string, List<RestMethodInfoInternal>> interfaceHttpMethods;
         readonly ConcurrentDictionary<
             CloseGenericMethodKey,
@@ -446,13 +447,6 @@ namespace Refit
             }
             else
             {
-                using var stream = await content
-                    .ReadAsStreamAsync(cancellationToken)
-                    .ConfigureAwait(false);
-                if (stream.CanSeek)
-                {
-                    await content.LoadIntoBufferAsync().ConfigureAwait(false);
-                }
                 result = await serializer
                     .FromHttpContentAsync<T>(content, cancellationToken)
                     .ConfigureAwait(false);
@@ -639,8 +633,9 @@ namespace Refit
                 var urlTarget =
                     (basePath == "/" ? string.Empty : basePath) + restMethod.RelativePath;
                 var queryParamsToAdd = new List<KeyValuePair<string, string?>>();
-                var headersToAdd = new Dictionary<string, string?>(restMethod.Headers);
-                var propertiesToAdd = new Dictionary<string, object?>();
+                var headersToAdd = restMethod.Headers.Count > 0 ?
+                    new Dictionary<string, string?>(restMethod.Headers)
+                    : null;
 
                 RestMethodParameterInfo? parameterInfo = null;
 
@@ -689,8 +684,8 @@ namespace Refit
                                                 Uri.EscapeDataString(
                                                     settings.UrlParameterFormatter.Format(
                                                         s,
-                                                        restMethod.ParameterInfoMap[i],
-                                                        restMethod.ParameterInfoMap[i].ParameterType
+                                                        restMethod.ParameterInfoArray[i],
+                                                        restMethod.ParameterInfoArray[i].ParameterType
                                                     ) ?? string.Empty
                                                 )
                                         )
@@ -702,8 +697,8 @@ namespace Refit
                                 replacement = Uri.EscapeDataString(
                                     settings.UrlParameterFormatter.Format(
                                         param,
-                                        restMethod.ParameterInfoMap[i],
-                                        restMethod.ParameterInfoMap[i].ParameterType
+                                        restMethod.ParameterInfoArray[i],
+                                        restMethod.ParameterInfoArray[i].ParameterType
                                     ) ?? string.Empty
                                 );
                             }
@@ -725,70 +720,7 @@ namespace Refit
                         && restMethod.BodyParameterInfo.Item3 == i
                     )
                     {
-                        if (param is HttpContent httpContentParam)
-                        {
-                            ret.Content = httpContentParam;
-                        }
-                        else if (param is Stream streamParam)
-                        {
-                            ret.Content = new StreamContent(streamParam);
-                        }
-                        // Default sends raw strings
-                        else if (
-                            restMethod.BodyParameterInfo.Item1 == BodySerializationMethod.Default
-                            && param is string stringParam
-                        )
-                        {
-                            ret.Content = new StringContent(stringParam);
-                        }
-                        else
-                        {
-                            switch (restMethod.BodyParameterInfo.Item1)
-                            {
-                                case BodySerializationMethod.UrlEncoded:
-                                    ret.Content = param is string str
-                                        ? (HttpContent)
-                                            new StringContent(
-                                                Uri.EscapeDataString(str),
-                                                Encoding.UTF8,
-                                                "application/x-www-form-urlencoded"
-                                            )
-                                        : new FormUrlEncodedContent(
-                                            new FormValueMultimap(param, settings)
-                                        );
-                                    break;
-                                case BodySerializationMethod.Default:
-#pragma warning disable CS0618 // Type or member is obsolete
-                                case BodySerializationMethod.Json:
-#pragma warning restore CS0618 // Type or member is obsolete
-                                case BodySerializationMethod.Serialized:
-                                    var content = serializer.ToHttpContent(param);
-                                    switch (restMethod.BodyParameterInfo.Item2)
-                                    {
-                                        case false:
-                                            ret.Content = new PushStreamContent(
-#pragma warning disable IDE1006 // Naming Styles
-                                                async (stream, _, __) =>
-#pragma warning restore IDE1006 // Naming Styles
-                                                {
-                                                    using (stream)
-                                                    {
-                                                        await content
-                                                            .CopyToAsync(stream)
-                                                            .ConfigureAwait(false);
-                                                    }
-                                                },
-                                                content.Headers.ContentType
-                                            );
-                                            break;
-                                        case true:
-                                            ret.Content = content;
-                                            break;
-                                    }
-
-                                    break;
-                            }
-                        }
+                        AddBodyToRequest(restMethod, param, ret);
 
                         isParameterMappedToRequest = true;
                     }
@@ -796,20 +728,21 @@ namespace Refit
                     // if header, add to request headers
                     if (restMethod.HeaderParameterMap.TryGetValue(i, out var headerParameterValue))
                     {
+                        headersToAdd ??= new Dictionary<string, string?>();
                         headersToAdd[headerParameterValue] = param?.ToString();
                         isParameterMappedToRequest = true;
                     }
 
                     //if header collection, add to request headers
-                    if (restMethod.HeaderCollectionParameterMap.Contains(i))
+                    if (restMethod.HeaderCollectionAt(i))
                     {
-                        var headerCollection =
-                            param as IDictionary<string, string>
-                            ?? new Dictionary<string, string>();
-
-                        foreach (var header in headerCollection)
+                        if (param is IDictionary<string, string> headerCollection)
                         {
-                            headersToAdd[header.Key] = header.Value;
+                            foreach (var header in headerCollection)
+                            {
+                                headersToAdd ??= new Dictionary<string, string?>();
+                                headersToAdd[header.Key] = header.Value;
+                            }
                         }
 
                         isParameterMappedToRequest = true;
@@ -821,15 +754,15 @@ namespace Refit
                         && restMethod.AuthorizeParameterInfo.Item2 == i
                     )
                     {
+                        headersToAdd ??= new Dictionary<string, string?>();
                         headersToAdd["Authorization"] =
                             $"{restMethod.AuthorizeParameterInfo.Item1} {param}";
                         isParameterMappedToRequest = true;
                     }
 
                     //if property, add to populate into HttpRequestMessage.Properties
-                    if (restMethod.PropertyParameterMap.TryGetValue(i, out var propertyParameter))
+                    if (restMethod.PropertyParameterMap.ContainsKey(i))
                     {
-                        propertiesToAdd[propertyParameter] = param;
                         isParameterMappedToRequest = true;
                     }
 
@@ -841,7 +774,7 @@ namespace Refit
                     // or if is an object bound to the path add any non-path bound properties to query string
                     // or if it's an object with a query attribute
                     var queryAttribute = restMethod
-                        .ParameterInfoMap[i]
+                        .ParameterInfoArray[i]
                         .GetCustomAttribute<QueryAttribute>();
                     if (
                         !restMethod.IsMultipart
@@ -850,115 +783,230 @@ namespace Refit
                         || queryAttribute != null
                     )
                     {
-                        var attr = queryAttribute ?? new QueryAttribute();
-                        if (DoNotConvertToQueryMap(param))
-                        {
-                            queryParamsToAdd.AddRange(
-                                ParseQueryParameter(
-                                    param,
-                                    restMethod.ParameterInfoMap[i],
-                                    restMethod.QueryParameterMap[i],
-                                    attr
-                                )
-                            );
-                        }
-                        else
-                        {
-                            foreach (var kvp in BuildQueryMap(param, attr.Delimiter, parameterInfo))
-                            {
-                                var path = !string.IsNullOrWhiteSpace(attr.Prefix)
-                                    ? $"{attr.Prefix}{attr.Delimiter}{kvp.Key}"
-                                    : kvp.Key;
-                                queryParamsToAdd.AddRange(
-                                    ParseQueryParameter(
-                                        kvp.Value,
-                                        restMethod.ParameterInfoMap[i],
-                                        path,
-                                        attr
-                                    )
-                                );
-                            }
-                        }
+                        AddQueryParameters(restMethod, queryAttribute, param, queryParamsToAdd, i, parameterInfo);
 
                         continue;
                     }
 
-                    // we are in a multipart method, add the part to the content
-                    // the parameter name should be either the attachment name or the parameter name (as fallback)
-                    string itemName;
-                    string parameterName;
+                    AddMultiPart(restMethod, i, param, multiPartContent);
+                }
 
-                    if (!restMethod.AttachmentNameMap.TryGetValue(i, out var attachment))
-                    {
-                        itemName = restMethod.QueryParameterMap[i];
-                        parameterName = itemName;
-                    }
-                    else
-                    {
-                        itemName = attachment.Item1;
-                        parameterName = attachment.Item2;
-                    }
+                AddHeadersToRequest(headersToAdd, ret);
 
-                    // Check to see if it's an IEnumerable
-                    var itemValue = param;
-                    var enumerable = itemValue as IEnumerable<object>;
-                    var typeIsCollection = enumerable != null;
+                AddPropertiesToRequest(restMethod, ret, paramList);
 
-                    if (typeIsCollection)
-                    {
-                        foreach (var item in enumerable!)
+                // NB: The URI methods in .NET are dumb. Also, we do this
+                // UriBuilder business so that we preserve any hardcoded query
+                // parameters as well as add the parameterized ones.
+                var uri = new UriBuilder(new Uri(BaseUri, urlTarget));
+                ParseExistingQueryString(uri, queryParamsToAdd);
+
+                if (queryParamsToAdd.Count != 0)
+                {
+                    uri.Query = CreateQueryString(queryParamsToAdd);;
+                }
+                else
+                {
+                    uri.Query = null;
+                }
+
+                ret.RequestUri = new Uri(
+                    uri.Uri.GetComponents(UriComponents.PathAndQuery, restMethod.QueryUriFormat),
+                    UriKind.Relative
+                );
+                return ret;
+            };
+        }
+
+        void AddBodyToRequest(RestMethodInfoInternal restMethod, object param, HttpRequestMessage ret)
+        {
+            if (param is HttpContent httpContentParam)
+            {
+                ret.Content = httpContentParam;
+            }
+            else if (param is Stream streamParam)
+            {
+                ret.Content = new StreamContent(streamParam);
+            }
+            // Default sends raw strings
+            else if (
+                restMethod.BodyParameterInfo!.Item1 == BodySerializationMethod.Default
+                && param is string stringParam
+            )
+            {
+                ret.Content = new StringContent(stringParam);
+            }
+            else
+            {
+                switch (restMethod.BodyParameterInfo.Item1)
+                {
+                    case BodySerializationMethod.UrlEncoded:
+                        ret.Content = param is string str
+                            ? (HttpContent)
+                            new StringContent(
+                                Uri.EscapeDataString(str),
+                                Encoding.UTF8,
+                                "application/x-www-form-urlencoded"
+                            )
+                            : new FormUrlEncodedContent(
+                                new FormValueMultimap(param, settings)
+                            );
+                        break;
+                    case BodySerializationMethod.Default:
+#pragma warning disable CS0618 // Type or member is obsolete
+                    case BodySerializationMethod.Json:
+#pragma warning restore CS0618 // Type or member is obsolete
+                    case BodySerializationMethod.Serialized:
+                        var content = serializer.ToHttpContent(param);
+                        switch (restMethod.BodyParameterInfo.Item2)
                         {
-                            AddMultipartItem(multiPartContent!, itemName, parameterName, item);
+                            case false:
+                                ret.Content = new PushStreamContent(
+#pragma warning disable IDE1006 // Naming Styles
+                                    async (stream, _, __) =>
+#pragma warning restore IDE1006 // Naming Styles
+                                    {
+                                        using (stream)
+                                        {
+                                            await content
+                                                .CopyToAsync(stream)
+                                                .ConfigureAwait(false);
+                                        }
+                                    },
+                                    content.Headers.ContentType
+                                );
+                                break;
+                            case true:
+                                ret.Content = content;
+                                break;
                         }
-                    }
-                    else
-                    {
-                        AddMultipartItem(multiPartContent!, itemName, parameterName, itemValue);
-                    }
+
+                        break;
                 }
+            }
+        }
 
-                // NB: We defer setting headers until the body has been
-                // added so any custom content headers don't get left out.
-                if (headersToAdd.Count > 0)
+        void AddQueryParameters(RestMethodInfoInternal restMethod, QueryAttribute? queryAttribute, object param,
+            List<KeyValuePair<string, string?>> queryParamsToAdd, int i, RestMethodParameterInfo? parameterInfo)
+        {
+            var attr = queryAttribute ?? DefaultQueryAttribute;
+            if (DoNotConvertToQueryMap(param))
+            {
+                queryParamsToAdd.AddRange(
+                    ParseQueryParameter(
+                        param,
+                        restMethod.ParameterInfoArray[i],
+                        restMethod.QueryParameterMap[i],
+                        attr
+                    )
+                );
+            }
+            else
+            {
+                foreach (var kvp in BuildQueryMap(param, attr.Delimiter, parameterInfo))
                 {
-                    // We could have content headers, so we need to make
-                    // sure we have an HttpContent object to add them to,
-                    // provided the HttpClient will allow it for the method
-                    if (ret.Content == null && !BodylessMethods.Contains(ret.Method))
-                        ret.Content = new ByteArrayContent(Array.Empty<byte>());
-
-                    foreach (var header in headersToAdd)
-                    {
-                        SetHeader(ret, header.Key, header.Value);
-                    }
+                    var path = !string.IsNullOrWhiteSpace(attr.Prefix)
+                        ? $"{attr.Prefix}{attr.Delimiter}{kvp.Key}"
+                        : kvp.Key;
+                    queryParamsToAdd.AddRange(
+                        ParseQueryParameter(
+                            kvp.Value,
+                            restMethod.ParameterInfoArray[i],
+                            path,
+                            attr
+                        )
+                    );
                 }
+            }
+        }
 
-                // Add RefitSetting.HttpRequestMessageOptions to the HttpRequestMessage
-                if (settings.HttpRequestMessageOptions != null)
+        void AddMultiPart(RestMethodInfoInternal restMethod, int i, object param,
+            MultipartFormDataContent? multiPartContent)
+        {
+            // we are in a multipart method, add the part to the content
+            // the parameter name should be either the attachment name or the parameter name (as fallback)
+            string itemName;
+            string parameterName;
+
+            if (!restMethod.AttachmentNameMap.TryGetValue(i, out var attachment))
+            {
+                itemName = restMethod.QueryParameterMap[i];
+                parameterName = itemName;
+            }
+            else
+            {
+                itemName = attachment.Item1;
+                parameterName = attachment.Item2;
+            }
+
+            // Check to see if it's an IEnumerable
+            var itemValue = param;
+            var enumerable = itemValue as IEnumerable<object>;
+            var typeIsCollection = enumerable != null;
+
+            if (typeIsCollection)
+            {
+                foreach (var item in enumerable!)
                 {
-                    foreach (var p in settings.HttpRequestMessageOptions)
-                    {
+                    AddMultipartItem(multiPartContent!, itemName, parameterName, item);
+                }
+            }
+            else
+            {
+                AddMultipartItem(multiPartContent!, itemName, parameterName, itemValue);
+            }
+        }
+
+        static void AddHeadersToRequest(Dictionary<string, string?>? headersToAdd, HttpRequestMessage ret)
+        {
+            // NB: We defer setting headers until the body has been
+            // added so any custom content headers don't get left out.
+            if (headersToAdd is null || headersToAdd.Count <= 0)
+                return;
+
+            // We could have content headers, so we need to make
+            // sure we have an HttpContent object to add them to,
+            // provided the HttpClient will allow it for the method
+            if (ret.Content == null && !IsBodyless(ret.Method))
+                ret.Content = new ByteArrayContent(Array.Empty<byte>());
+
+            foreach (var header in headersToAdd)
+            {
+                SetHeader(ret, header.Key, header.Value);
+            }
+        }
+
+        void AddPropertiesToRequest(RestMethodInfoInternal restMethod, HttpRequestMessage ret, object[] paramList)
+        {
+            // Add RefitSetting.HttpRequestMessageOptions to the HttpRequestMessage
+            if (settings.HttpRequestMessageOptions != null)
+            {
+                foreach (var p in settings.HttpRequestMessageOptions)
+                {
 #if NET6_0_OR_GREATER
                         ret.Options.Set(new HttpRequestOptionsKey<object>(p.Key), p.Value);
 #else
-                        ret.Properties.Add(p);
+                    ret.Properties.Add(p);
 #endif
-                    }
                 }
+            }
 
-                foreach (var property in propertiesToAdd)
+            for (var i = 0; i < paramList.Length; i++)
+            {
+                if (restMethod.PropertyParameterMap.TryGetValue(i, out var propertyKey))
                 {
 #if NET6_0_OR_GREATER
                     ret.Options.Set(
-                        new HttpRequestOptionsKey<object?>(property.Key),
-                        property.Value
+                        new HttpRequestOptionsKey<object?>(propertyKey),
+                        paramList[i]
                     );
 #else
-                    ret.Properties[property.Key] = property.Value;
+                    ret.Properties[propertyKey] = paramList[i];
 #endif
                 }
+            }
 
-                // Always add the top-level type of the interface to the properties
+            // Always add the top-level type of the interface to the properties
 #if NET6_0_OR_GREATER
                 ret.Options.Set(
                     new HttpRequestOptionsKey<Type>(HttpRequestMessageOptions.InterfaceType),
@@ -971,45 +1019,10 @@ namespace Refit
                     restMethod.ToRestMethodInfo()
                 );
 #else
-                ret.Properties[HttpRequestMessageOptions.InterfaceType] = TargetType;
-                ret.Properties[HttpRequestMessageOptions.RestMethodInfo] =
-                    restMethod.ToRestMethodInfo();
+            ret.Properties[HttpRequestMessageOptions.InterfaceType] = TargetType;
+            ret.Properties[HttpRequestMessageOptions.RestMethodInfo] =
+                restMethod.ToRestMethodInfo();
 #endif
-
-                // NB: The URI methods in .NET are dumb. Also, we do this
-                // UriBuilder business so that we preserve any hardcoded query
-                // parameters as well as add the parameterized ones.
-                var uri = new UriBuilder(new Uri(new Uri("http://api"), urlTarget));
-                var query = HttpUtility.ParseQueryString(uri.Query ?? "");
-                foreach (var key in query.AllKeys)
-                {
-                    if (!string.IsNullOrWhiteSpace(key))
-                    {
-                        queryParamsToAdd.Insert(
-                            0,
-                            new KeyValuePair<string, string?>(key, query[key])
-                        );
-                    }
-                }
-
-                if (queryParamsToAdd.Count != 0)
-                {
-                    uri.Query = CreateQueryString(queryParamsToAdd);;
-                }
-                else
-                {
-                    uri.Query = null;
-                }
-
-                var uriFormat =
-                    restMethod.MethodInfo.GetCustomAttribute<QueryUriFormatAttribute>()?.UriFormat
-                    ?? UriFormat.UriEscaped;
-                ret.RequestUri = new Uri(
-                    uri.Uri.GetComponents(UriComponents.PathAndQuery, uriFormat),
-                    UriKind.Relative
-                );
-                return ret;
-            };
         }
 
         IEnumerable<KeyValuePair<string, string?>> ParseQueryParameter(
@@ -1074,13 +1087,13 @@ namespace Refit
 
                 default:
                     var delimiter =
-                        collectionFormat == CollectionFormat.Ssv
-                            ? " "
-                            : collectionFormat == CollectionFormat.Tsv
-                                ? "\t"
-                                : collectionFormat == CollectionFormat.Pipes
-                                    ? "|"
-                                    : ",";
+                        collectionFormat switch
+                        {
+                            CollectionFormat.Ssv => " ",
+                            CollectionFormat.Tsv => "\t",
+                            CollectionFormat.Pipes => "|",
+                            _ => ","
+                        };
 
                     // Missing a "default" clause was preventing the collection from serializing at all, as it was hitting "continue" thus causing an off-by-one error
                     var formattedValues = paramValues
@@ -1097,6 +1110,25 @@ namespace Refit
                     yield return string.Join(delimiter, formattedValues);
 
                     break;
+            }
+        }
+
+        static void ParseExistingQueryString(UriBuilder uri, List<KeyValuePair<string, string?>> queryParamsToAdd)
+        {
+            if (string.IsNullOrEmpty(uri.Query))
+                return;
+
+            var query = HttpUtility.ParseQueryString(uri.Query);
+            var index = 0;
+            foreach (var key in query.AllKeys)
+            {
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    queryParamsToAdd.Insert(
+                        index++,
+                        new KeyValuePair<string, string?>(key, query[key])
+                    );
+                }
             }
         }
 
@@ -1295,5 +1327,7 @@ namespace Refit
                 request.Content.Headers.TryAddWithoutValidation(name, value);
             }
         }
+
+        static bool IsBodyless(HttpMethod method) => method == HttpMethod.Get || method == HttpMethod.Head;
     }
 }
